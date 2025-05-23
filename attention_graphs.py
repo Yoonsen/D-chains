@@ -89,7 +89,7 @@ def visualize_per_layer(text, model_name="bert-base-cased", layer_range=(4, 9), 
     Gs = []
     for layer in range(start, end):
         attn = attentions[layer][0].mean(dim=0).numpy()
-        G = nx.Graph()
+        G = nx.DiGraph()
         G.add_nodes_from(tokens)
 
         for i, token in enumerate(tokens):
