@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# Environment
+.env
+.venv/
+env/
+venv/
+*.env
+pip-log.txt
+poetry.lock
+
+# VSCode / PyCharm / general
+.vscode/
+.idea/
+*.log
+
+# Data, models and checkpoints
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.h5
+*.onnx
+*.joblib
+*.pkl
+*.npz
+
+# Streamlit
+.streamlit/config.toml
+**/.mypy_cache/
+**/.pytest_cache/
+
+# HTML exports / temp files
+*.html
+*.tmp
+*.temp
+*.swp
+*.DS_Store
