@@ -1,0 +1,8 @@
+streamlit
+transformers
+torch
+networkx
+matplotlib
+pyvis
+pandas
+numpy
