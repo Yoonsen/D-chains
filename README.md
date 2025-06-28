@@ -1,6 +1,6 @@
-# 🔍 BERT Attention Graph Explorer
+# 🔍 LLM Attention Graph Explorer
 
-Visualiser attention-strukturer fra transformer-baserte språkmodeller som grafnettverk!  
+Visualiser attention-strukturer fra transformer-baserte språkmodeller som grafnettverk.
 Skriv inn en setning, velg modell, og få opp både lagvise og aggregerte attention-grafer – direkte i Streamlit med Pyvis-interaktivitet.
 
 ## 🚀 Kom i gang
