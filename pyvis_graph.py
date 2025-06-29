@@ -6,11 +6,11 @@ import os
 def graph_to_pyvis(G, title="Layer"):
     net = Network(height="500px", width="100%", directed=False)
     for node in G.nodes:
-        net.add_node(node, label=node)
+        net.add_node(node, label=G.nodes[node].get("label", str(node)), font={'size':12})
     for u, v, data in G.edges(data=True):
         weight = round(data.get("weight", 1), 3)
         label = data.get("label", f"{u}-{v}")
-        net.add_edge(u, v, value=weight, title=label, label=label)
+        net.add_edge(u, v, value=weight, label=label, font={'size': 12})
     net.set_options("""var options = { "physics": { "barnesHut": { "gravitationalConstant": -8000, "centralGravity": 0.3, "springLength": 95 }, "minVelocity": 0.75 } }""")
     return net
 

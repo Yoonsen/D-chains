@@ -76,45 +76,83 @@ def visualize_soft_dependencies(text, model_name="bert-base-cased", layer_range=
 
 
 
-def visualize_per_layer(text, model_name="bert-base-cased", layer_range=(4, 9), top_k=3):
+import pandas as pd
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+def visualize_per_layer(text, model_name="bert-base-cased", layer_range=(4, 9), top_k=3, group_subwords=True):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name, output_attentions=True)
+
     inputs = tokenizer(text, return_tensors="pt")
+    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+
+    # Filtrer bort [CLS] og [SEP], behold posisjon
+    tokens_filtered = [(i, t.replace("##", "-")) for i, t in enumerate(tokens) if t not in ("[CLS]", "[SEP]")]
+
     with torch.no_grad():
         outputs = model(**inputs)
+        attentions = outputs.attentions
 
-    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-    attentions = outputs.attentions
     start, end = layer_range
     Gs = []
+
     for layer in range(start, end):
-        attn = attentions[layer][0].mean(dim=0).numpy()
+        attn = attentions[layer][0].mean(dim=0).detach().cpu().numpy()
         G = nx.DiGraph()
-        G.add_nodes_from(tokens)
 
-        for i, token in enumerate(tokens):
-            if token in ['[CLS]', '[SEP]']:
-                continue
-            top_indices = np.argsort(attn[i])[-top_k:]
+        for i, label in tokens_filtered:
+            G.add_node(i, label=label)
+
+        for i, _ in tokens_filtered:
+            scores = np.zeros(len(tokens))
+            for j in range(len(tokens)):
+                scores[j] = attn[i][j]
+
+            top_indices = np.argsort(scores)[-top_k:]
             for j in top_indices:
-                source = tokens[j]
-                if source not in ['[CLS]', '[SEP]']:
-                    label = f"({source}, {token})"
-                    weight = round(float(attn[i][j]), 3)
-                    G.add_edge(source, token, label=label, weight=weight)
+                if j == i or tokens[j] in ("[CLS]", "[SEP]"):
+                    continue
+                label = f"({tokens[j].replace('##','-')}, {tokens[i].replace('##','-')})"
+                weight = round(float(attn[i][j]), 3)
+                G.add_edge(j, i, label=label, weight=weight)
 
-        # pos = nx.spring_layout(G, seed=42)
-        # edge_labels = nx.get_edge_attributes(G, 'label')
-        # weights = [G[u][v]['weight'] * 5 for u, v in G.edges()]
-
-        # plt.figure(figsize=(12, 7))
-        # nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', width=weights, font_weight='bold')
-        # nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='darkgreen')
-        # plt.title(f"Layer {layer}: Soft Dependency Graph")
-        # plt.show()
         Gs.append(G)
-    return Gs
 
+    return Gs, [t.replace("##", "-") for t in tokens if t not in ("[CLS]", "[SEP]")]
+
+def find_3clique_clusters(G, word_order=None):
+    cliques = [set(c) for c in nx.enumerate_all_cliques(G) if len(c) == 3]
+    merged = []
+
+    while cliques:
+        base = cliques.pop(0)
+        changed = True
+        while changed:
+            changed = False
+            to_merge = []
+            for c in cliques:
+                if len(base & c) >= 2:
+                    base |= c
+                    to_merge.append(c)
+                    changed = True
+            for c in to_merge:
+                cliques.remove(c)
+        merged.append(base)
+
+    if word_order:
+        merged = [
+            [word_order[n] for n in sorted(cluster) if n < len(word_order)]
+            for cluster in merged
+        ]
+    else:
+        merged = [sorted(list(cluster), key=lambda w: w) for cluster in merged]
+
+    return merged  # list of sorted clusters only
 
 
 # Define the function to analyze subword fragmentation
