@@ -19,8 +19,8 @@ with col1:
     text = st.text_input("Input sentence", "who do you want to compete with?")
 with col2:
     model = st.selectbox("Model", [
-        "NbAiLab/nb-bert-base",
         "bert-base-multilingual-cased",
+        "NbAiLab/nb-bert-base",
     ])
 with col3:
     st.markdown(" ")
