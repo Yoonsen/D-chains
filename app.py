@@ -31,11 +31,7 @@ if run:
     layers, words = at.visualize_per_layer(text, model_name=model)
     
     # DEBUG: Se hva vi faktisk har
-    st.write("**Debug info:**")
-    st.write(f"Antall ord: {len(words)}")
-    st.write(f"Ord: {words}")
-    st.write(f"Node IDer i første lag: {list(layers[0].nodes())}")
-    
+        
     pg.show_pyvis_layers(layers, words) 
     st.write("### Phrasal structures from graphs")
     for i, layer in enumerate(layers, 1):
