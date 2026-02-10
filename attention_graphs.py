@@ -1,11 +1,43 @@
 
 import pandas as pd
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import torch
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from functools import lru_cache
+
+
+SPECIAL_TOKENS = {
+    "[CLS]",
+    "[SEP]",
+    "[PAD]",
+    "[UNK]",
+    "<bos>",
+    "<eos>",
+    "<pad>",
+    "<unk>",
+    "<s>",
+    "</s>",
+}
+
+
+def _is_special_token(token):
+    if token in SPECIAL_TOKENS:
+        return True
+    # Covers model-specific placeholders like <|...|>
+    if token.startswith("<|") and token.endswith("|>"):
+        return True
+    return False
+
+
+def _normalize_token_label(token):
+    # WordPiece continuation marker.
+    normalized = token.replace("##", "-")
+    # SentencePiece / GPT-style word boundary markers.
+    normalized = normalized.replace("▁", "").replace("Ġ", "")
+    return normalized.strip()
 
 def extract_soft_dependency_tree(text, model_name="bert-base-cased", layer_range=(4, 9)):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -84,21 +116,99 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-def visualize_per_layer(text, model_name="bert-base-cased", layer_range=(4, 9), top_k=3, group_subwords=True):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name, output_attentions=True)
+@lru_cache(maxsize=8)
+def _load_model_bundle(model_name, cache_dir=None, use_cuda=True):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+    )
 
-    inputs = tokenizer(text, return_tensors="pt")
+    load_kwargs = {
+        "output_attentions": True,
+        "cache_dir": cache_dir,
+        "trust_remote_code": True,
+        "attn_implementation": "eager",
+    }
+
+    model = None
+    load_errors = []
+
+    for loader in (AutoModelForCausalLM, AutoModel):
+        try:
+            model = loader.from_pretrained(model_name, **load_kwargs)
+            break
+        except TypeError:
+            # Some models do not accept attn_implementation on load.
+            fallback_kwargs = dict(load_kwargs)
+            fallback_kwargs.pop("attn_implementation", None)
+            try:
+                model = loader.from_pretrained(model_name, **fallback_kwargs)
+                break
+            except Exception as exc:  # noqa: PERF203
+                load_errors.append(f"{loader.__name__}: {exc}")
+        except Exception as exc:  # noqa: PERF203
+            load_errors.append(f"{loader.__name__}: {exc}")
+
+    if model is None:
+        joined_errors = "\n".join(load_errors)
+        raise RuntimeError(f"Could not load model '{model_name}'.\n{joined_errors}")
+
+    if hasattr(model, "config"):
+        model.config.output_attentions = True
+        if hasattr(model.config, "_attn_implementation"):
+            model.config._attn_implementation = "eager"
+
+    device = "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    model.eval()
+    return tokenizer, model, device
+
+
+def visualize_per_layer(
+    text,
+    model_name="bert-base-cased",
+    layer_range=(4, 9),
+    top_k=3,
+    group_subwords=True,
+    cache_dir=None,
+    use_cuda=True,
+):
+    tokenizer, model, device = _load_model_bundle(
+        model_name=model_name,
+        cache_dir=cache_dir,
+        use_cuda=use_cuda,
+    )
+
+    inputs = tokenizer(text, return_tensors="pt").to(device)
     tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
 
-    # Filtrer bort [CLS] og [SEP], behold posisjon
-    tokens_filtered = [(i, t.replace("##", "-")) for i, t in enumerate(tokens) if t not in ("[CLS]", "[SEP]")]
+    # Filter special tokens and empty spacer tokens, but keep original positions.
+    tokens_filtered = []
+    word_order = [None] * len(tokens)
+    for i, token in enumerate(tokens):
+        if _is_special_token(token):
+            continue
+        clean_label = _normalize_token_label(token)
+        if not clean_label:
+            continue
+        tokens_filtered.append((i, clean_label))
+        word_order[i] = clean_label
 
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = model(**inputs, output_attentions=True)
         attentions = outputs.attentions
 
+    if attentions is None:
+        raise ValueError(
+            f"Model '{model_name}' did not return attention tensors. "
+            "Try another model or update transformers."
+        )
+
+    num_layers = len(attentions)
     start, end = layer_range
+    start = max(0, min(start, num_layers - 1))
+    end = max(start + 1, min(end, num_layers))
     Gs = []
 
     for layer in range(start, end):
@@ -115,15 +225,17 @@ def visualize_per_layer(text, model_name="bert-base-cased", layer_range=(4, 9), 
 
             top_indices = np.argsort(scores)[-top_k:]
             for j in top_indices:
-                if j == i or tokens[j] in ("[CLS]", "[SEP]"):
+                if j == i or _is_special_token(tokens[j]):
                     continue
-                label = f"({tokens[j].replace('##','-')}, {tokens[i].replace('##','-')})"
+                source_label = _normalize_token_label(tokens[j])
+                target_label = _normalize_token_label(tokens[i])
+                label = f"({source_label}, {target_label})"
                 weight = round(float(attn[i][j]), 3)
                 G.add_edge(j, i, label=label, weight=weight)
 
         Gs.append(G)
 
-    return Gs, [t.replace("##", "-") for t in tokens if t not in ("[CLS]", "[SEP]")]
+    return Gs, word_order
 
 def find_3clique_clusters(G, word_order=None):
     cliques = [set(c) for c in nx.enumerate_all_cliques(G) if len(c) == 3]
@@ -146,7 +258,7 @@ def find_3clique_clusters(G, word_order=None):
 
     if word_order:
         merged = [
-            [word_order[n] for n in sorted(cluster) if n < len(word_order)]
+            [word_order[n] for n in sorted(cluster) if n < len(word_order) and word_order[n]]
             for cluster in merged
         ]
     else:

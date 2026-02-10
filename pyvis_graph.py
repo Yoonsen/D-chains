@@ -1,4 +1,5 @@
 from pyvis.network import Network
+import streamlit as st
 import streamlit.components.v1 as components
 import tempfile
 import os
@@ -6,10 +7,12 @@ import os
 def graph_to_pyvis(G, words, title="Layer"):
     net = Network(height="600px", width="100%", directed=False, bgcolor="#f8f9fa")
     
-    # Legg til noder med ord fra words-listen
+    # Use node labels stored in graph nodes when available.
     for node in G.nodes:
-        # Node-ID starter på 1, words-liste starter på 0
-        word_label = words[node - 1] if (node - 1) < len(words) and node > 0 else str(node)
+        node_data = G.nodes[node] if node in G.nodes else {}
+        word_label = node_data.get("label")
+        if not word_label:
+            word_label = str(node)
         
         net.add_node(
             node,
@@ -111,16 +114,12 @@ def graph_to_pyvis(G, words, title="Layer"):
     return net
 
 def show_pyvis_layers(layers, words):
-    for i, G in enumerate(layers[:-1], 1):
+    total_layers = len(layers)
+
+    for i, G in enumerate(layers, 1):
+        st.caption(f"Lag {i} av {total_layers}")
         net = graph_to_pyvis(G, words, title=f"Layer {i}")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
             net.save_graph(tmp.name)
             components.html(open(tmp.name, 'r', encoding='utf-8').read(), height=650)
             os.unlink(tmp.name)
-    
-    # Show combined graph
-    combined_net = graph_to_pyvis(layers[-1], words, title="Combined Graph")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
-        combined_net.save_graph(tmp.name)
-        components.html(open(tmp.name, 'r', encoding='utf-8').read(), height=650)
-        os.unlink(tmp.name)

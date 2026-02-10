@@ -32,11 +32,13 @@ poetry.lock
 *.pt
 *.pth
 *.bin
+*.safetensors
 *.h5
 *.onnx
 *.joblib
 *.pkl
 *.npz
+models/hf-cache/
 
 # Streamlit
 .streamlit/config.toml
