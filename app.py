@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, AutoModel
 from pyvis.network import Network
 import streamlit.components.v1 as components
 
-# --- 1. TOKEN VERKTØY ---
+# --- 1. UTILITIES ---
 SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "[UNK]", "<s>", "</s>", "<pad>", "<mask()"}
 
 def is_special(token):
@@ -18,7 +18,7 @@ def format_token_label(token, index):
     label = f"-{clean}" if token.startswith("##") else clean
     return f"{label}_{index}"
 
-# --- 2. DATAHENTING ---
+# --- 2. DATA ---
 @st.cache_resource
 def load_model(model_name):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -33,16 +33,10 @@ def get_metrics(text, tokenizer, model):
     tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
     return attentions, tokens
 
-def calculate_layer_stats(attn_tensor):
-    avg_attn = attn_tensor.mean(dim=0).detach().cpu().numpy()
-    epsilon = 1e-10
-    entropy = -np.sum(avg_attn * np.log(avg_attn + epsilon), axis=-1)
-    return avg_attn, entropy
-
-# --- 3. PYVIS VISUALISERING (Større font & Sentrerings-fix) ---
+# --- 3. PYVIS (Vertikal/Stor font) ---
 def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
-    # Høyere boks (700px) for mer plass
-    net = Network(height="700px", width="100%", notebook=False, directed=True)
+    # Bruker 600px høyde, men full bredde i vertikal layout
+    net = Network(height="600px", width="100%", notebook=False, directed=True)
     
     e_min, e_max = float(np.min(entropy)), float(np.max(entropy))
     
@@ -55,16 +49,13 @@ def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
         norm_e = (e_val - e_min) / (e_max - e_min + 1e-6)
         node_color = f"rgb({int(255*(1-norm_e))}, 100, {int(255*norm_e)})"
         
-        # Kvadratiske bokser, MYE større font og padding
         net.add_node(
             int(i), 
             label=display_label, 
-            title=f"Full: {token} | Entropi: {e_val:.3f}", 
             color=node_color,
             shape="box", 
-            font={'size': 28, 'color': 'white', 'face': 'monospace', 'multi': True},
-            margin=15,
-            borderWidth=2
+            font={'size': 32, 'color': 'white', 'face': 'monospace'},
+            margin=12
         )
 
     for i in range(len(tokens)):
@@ -77,97 +68,96 @@ def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
                     continue
                 if i == j: continue 
                 
-                net.add_edge(
-                    int(j), int(i), 
-                    value=weight * 20, 
-                    title=f"Vekt: {weight:.3f}",
-                    color={'color': 'rgba(120, 120, 120, 0.4)', 'highlight': 'red'},
-                    arrows='to'
-                )
+                net.add_edge(int(j), int(i), value=weight * 20, arrows='to')
     
-    # Layout-innstillinger optimert for trackpad og oversikt
     net.set_options("""
     {
       "physics": {
-        "forceAtlas2Based": {
-          "gravitationalConstant": -250,
-          "centralGravity": 0.005,
-          "springLength": 200,
-          "springConstant": 0.08,
-          "avoidOverlap": 1
-        },
-        "solver": "forceAtlas2Based",
-        "stabilization": { "enabled": true, "iterations": 100 }
+        "forceAtlas2Based": { "gravitationalConstant": -200, "springLength": 200, "avoidOverlap": 1 },
+        "solver": "forceAtlas2Based"
       },
-      "interaction": {
-        "hover": true,
-        "zoomView": true,
-        "dragView": true,
-        "navigationButtons": true
-      },
-      "edges": { "smooth": { "type": "curvedArrow", "roundness": 0.2 } }
+      "interaction": { "navigationButtons": true, "zoomView": true }
     }
     """)
     return net
 
+def get_phrases(tokens, avg_attn):
+    G = nx.Graph()
+    for i in range(len(tokens)):
+        for j in range(len(tokens)):
+            if avg_attn[i,j] > 0.15: G.add_edge(i, j)
+    
+    cliques = [c for c in nx.find_cliques(G) if len(c) >= 3]
+    phrases = []
+    for c in cliques:
+        p = " + ".join([format_token_label(tokens[idx], idx) for idx in sorted(c) if not is_special(tokens[idx])])
+        if p: phrases.append(p)
+    return phrases
+
 # --- 4. STREAMLIT UI ---
-st.set_page_config(page_title="D-chains Visualizer", layout="wide")
-st.title("🔗 D-chains: Koreferanse-analyse")
+st.set_page_config(page_title="D-chains Vertical", layout="wide")
+st.title("🔗 D-chains: Vertikal Analyse")
 
 with st.sidebar:
-    st.header("Kontrollpanel")
     model_name = st.selectbox("Modell", ["bert-base-multilingual-cased", "NbAiLab/nb-bert-base"])
-    hide_sys = st.checkbox("Skjul spesialtokens", value=True)
-    
-    # Knapp for å tvinge re-render (sentrering)
-    recenter = st.button("🔄 Sentrer grafer")
-    
-    st.markdown("---")
-    st.write("🔴 = Sikker | 🔵 = Usikker")
+    hide_sys = st.checkbox("Skjul spesialtokens (Graf & Tabell)", value=True)
+    st.write("🔴 Sikker | 🔵 Usikker")
 
 text = st.text_input("Setning:", "Ola kjøpte et båthus. Han likte det.")
 
 if text:
     tokenizer, model = load_model(model_name)
     attentions, tokens = get_metrics(text, tokenizer, model)
-    
     num_layers = attentions.shape[0]
     layer_indices = [0, num_layers // 2, num_layers - 1]
-    
-    # Lag 3 store kolonner
-    cols = st.columns(len(layer_indices))
-    final_layer_data = []
 
-    for i, l_idx in enumerate(layer_indices):
-        with cols[i]:
-            st.subheader(f"Lag {l_idx + 1}")
-            avg_attn, entropy = calculate_layer_stats(attentions[l_idx])
-            
-            net = create_styled_graph(tokens, avg_attn, entropy, hide_sys)
-            
-            # Navngi filen unikt slik at 'Sentrer' tvinger ny lasting
-            path = f"graph_l{l_idx}_{'reset' if recenter else 'init'}.html"
-            net.save_graph(path)
-            
-            with open(path, 'r', encoding='utf-8') as f:
-                components.html(f.read(), height=720) # Økt høyde for iframe
-            
-            if i == len(layer_indices) - 1:
-                for src_idx in range(len(tokens)):
-                    for tgt_idx in range(len(tokens)):
-                        w = float(avg_attn[src_idx, tgt_idx])
-                        if w > 0.005:
-                            final_layer_data.append({
-                                "Fra_Index": src_idx, "Fra_Token": tokens[src_idx],
-                                "Til_Index": tgt_idx, "Til_Token": tokens[tgt_idx],
-                                "Vekt": round(w, 5), "Entropi_Fra": round(float(entropy[src_idx]), 3)
-                            })
+    # --- VERTIKAL ORGANISERING ---
+    for l_idx in layer_indices:
+        st.write(f"## 🛠 Lag {l_idx + 1}")
+        avg_attn, entropy = calculate_layer_stats = (lambda a: (
+            a.mean(dim=0).detach().cpu().numpy(), 
+            -np.sum(a.mean(dim=0).detach().cpu().numpy() * np.log(a.mean(dim=0).detach().cpu().numpy() + 1e-10), axis=-1)
+        ))(attentions[l_idx])
+        
+        # 1. Graf
+        net = create_styled_graph(tokens, avg_attn, entropy, hide_sys)
+        path = f"graph_v{l_idx}.html"
+        net.save_graph(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            components.html(f.read(), height=620)
+        
+        # 2. Fraser
+        phrases = get_phrases(tokens, avg_attn)
+        if phrases:
+            st.write("**Identifiserte frase-klynger:**")
+            for p in phrases: st.info(p)
+        else:
+            st.write("*Ingen sterke fraser funnet i dette laget.*")
+        st.write("---")
 
-    # --- 5. RÅDATA TABELL ---
-    st.write("---")
-    st.write("### 📊 Rådata for Python-analyse (Siste lag)")
+    # --- 5. DIN SISTE DATARAMME ---
+    st.write("### 📊 Komplett Rådata (Siste Lag)")
     
-    df_final = pd.DataFrame(final_layer_data)
-    if not df_final.empty:
-        df_final = df_final[["Fra_Index", "Fra_Token", "Til_Index", "Til_Token", "Vekt", "Entropi_Fra"]]
-        st.dataframe(df_final.sort_values(by="Vekt", ascending=False), use_container_width=True)
+    last_attn, last_entropy = (lambda a: (
+        a.mean(dim=0).detach().cpu().numpy(), 
+        -np.sum(a.mean(dim=0).detach().cpu().numpy() * np.log(a.mean(dim=0).detach().cpu().numpy() + 1e-10), axis=-1)
+    ))(attentions[layer_indices[-1]])
+
+    table_data = []
+    for i in range(len(tokens)):
+        for j in range(len(tokens)):
+            # Filtrer tabellen basert på samme checkbox som grafen
+            if hide_sys and (is_special(tokens[i]) or is_special(tokens[j])):
+                continue
+            
+            w = float(last_attn[i, j])
+            if w > 0.001:
+                table_data.append({
+                    "Fra_Index": i, "Fra_Token": tokens[i],
+                    "Til_Index": j, "Til_Token": tokens[j],
+                    "Vekt": round(w, 5), "Entropi_Fra": round(float(last_entropy[i]), 3)
+                })
+    
+    df = pd.DataFrame(table_data)
+    if not df.empty:
+        st.dataframe(df.sort_values(by="Vekt", ascending=False), use_container_width=True)
