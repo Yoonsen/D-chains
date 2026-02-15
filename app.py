@@ -6,6 +6,7 @@ import networkx as nx
 from transformers import AutoTokenizer, AutoModel
 from pyvis.network import Network
 import streamlit.components.v1 as components
+from collections import Counter
 
 # --- 1. UTILITIES ---
 SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "[UNK]", "<s>", "</s>", "<pad>", "<mask()"}
@@ -13,10 +14,24 @@ SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]", "[UNK]", "<s>", "</s>", "<pad>", "<
 def is_special(token):
     return token in SPECIAL_TOKENS or (token.startswith("<|") and token.endswith("|>"))
 
-def format_token_label(token, index):
-    clean = token.replace("##", "").replace("Ġ", "").replace(" ", "").strip()
-    label = f"-{clean}" if token.startswith("##") else clean
-    return f"{label}_{index}"
+def get_clean_label(token):
+    return token.replace("##", "").replace("Ġ", "").replace(" ", "").strip()
+
+def get_token_labels(tokens):
+    """Genererer etiketter som kun har indeks ved tvetydighet."""
+    clean_tokens = [get_clean_label(t) for t in tokens]
+    counts = Counter(clean_tokens)
+    labels = []
+    
+    for i, t in enumerate(tokens):
+        clean = clean_tokens[i]
+        prefix = "-" if t.startswith("##") else ""
+        # Legg til indeks kun hvis ordet finnes flere ganger
+        if counts[clean] > 1 and not is_special(t):
+            labels.append(f"{prefix}{clean}_{i}")
+        else:
+            labels.append(f"{prefix}{clean}")
+    return labels
 
 # --- 2. DATA ---
 @st.cache_resource
@@ -33,18 +48,22 @@ def get_metrics(text, tokenizer, model):
     tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
     return attentions, tokens
 
+def calculate_layer_stats(attn_tensor):
+    avg_attn = attn_tensor.mean(dim=0).detach().cpu().numpy()
+    epsilon = 1e-10
+    entropy = -np.sum(avg_attn * np.log(avg_attn + epsilon), axis=-1)
+    return avg_attn, entropy
+
 # --- 3. PYVIS (Vertikal/Stor font) ---
-def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
-    # Bruker 600px høyde, men full bredde i vertikal layout
-    net = Network(height="600px", width="100%", notebook=False, directed=True)
-    
+def create_styled_graph(tokens, labels, avg_attn, entropy, hide_sys=True):
+    net = Network(height="650px", width="100%", notebook=False, directed=True)
     e_min, e_max = float(np.min(entropy)), float(np.max(entropy))
     
     for i, token in enumerate(tokens):
         if hide_sys and is_special(token):
             continue
             
-        display_label = format_token_label(token, i)
+        display_label = labels[i]
         e_val = float(entropy[i])
         norm_e = (e_val - e_min) / (e_max - e_min + 1e-6)
         node_color = f"rgb({int(255*(1-norm_e))}, 100, {int(255*norm_e)})"
@@ -54,8 +73,9 @@ def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
             label=display_label, 
             color=node_color,
             shape="box", 
-            font={'size': 32, 'color': 'white', 'face': 'monospace'},
-            margin=12
+            font={'size': 34, 'color': 'white', 'face': 'monospace'},
+            margin=15,
+            title=f"Original: {token}\nIndeks: {i}\nEntropi: {e_val:.3f}"
         )
 
     for i in range(len(tokens)):
@@ -67,13 +87,12 @@ def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
                 if hide_sys and (is_special(tokens[i]) or is_special(tokens[j])):
                     continue
                 if i == j: continue 
-                
-                net.add_edge(int(j), int(i), value=weight * 20, arrows='to')
+                net.add_edge(int(j), int(i), value=weight * 22, arrows='to', color='rgba(150,150,150,0.5)')
     
     net.set_options("""
     {
       "physics": {
-        "forceAtlas2Based": { "gravitationalConstant": -200, "springLength": 200, "avoidOverlap": 1 },
+        "forceAtlas2Based": { "gravitationalConstant": -250, "springLength": 250, "avoidOverlap": 1 },
         "solver": "forceAtlas2Based"
       },
       "interaction": { "navigationButtons": true, "zoomView": true }
@@ -81,80 +100,50 @@ def create_styled_graph(tokens, avg_attn, entropy, hide_sys=True):
     """)
     return net
 
-def get_phrases(tokens, avg_attn):
-    G = nx.Graph()
-    for i in range(len(tokens)):
-        for j in range(len(tokens)):
-            if avg_attn[i,j] > 0.15: G.add_edge(i, j)
-    
-    cliques = [c for c in nx.find_cliques(G) if len(c) >= 3]
-    phrases = []
-    for c in cliques:
-        p = " + ".join([format_token_label(tokens[idx], idx) for idx in sorted(c) if not is_special(tokens[idx])])
-        if p: phrases.append(p)
-    return phrases
-
 # --- 4. STREAMLIT UI ---
-st.set_page_config(page_title="D-chains Vertical", layout="wide")
-st.title("🔗 D-chains: Vertikal Analyse")
+st.set_page_config(page_title="D-chains Coreference", layout="wide")
+st.title("🔗 D-chains: Analyse av Koreferanse")
 
 with st.sidebar:
     model_name = st.selectbox("Modell", ["bert-base-multilingual-cased", "NbAiLab/nb-bert-base"])
-    hide_sys = st.checkbox("Skjul spesialtokens (Graf & Tabell)", value=True)
-    st.write("🔴 Sikker | 🔵 Usikker")
+    hide_sys = st.checkbox("Skjul spesialtokens", value=True)
+    st.info("💡 Indekser vises kun ved tvetydighet (f.eks. 'han_7').")
 
-text = st.text_input("Setning:", "Ola kjøpte et båthus. Han likte det.")
+text = st.text_input("Setning for analyse:", "Ola elsket Marit. Han ga henne en ring.")
 
 if text:
     tokenizer, model = load_model(model_name)
     attentions, tokens = get_metrics(text, tokenizer, model)
+    labels = get_token_labels(tokens)
+    
     num_layers = attentions.shape[0]
     layer_indices = [0, num_layers // 2, num_layers - 1]
 
-    # --- VERTIKAL ORGANISERING ---
     for l_idx in layer_indices:
         st.write(f"## 🛠 Lag {l_idx + 1}")
-        avg_attn, entropy = calculate_layer_stats = (lambda a: (
-            a.mean(dim=0).detach().cpu().numpy(), 
-            -np.sum(a.mean(dim=0).detach().cpu().numpy() * np.log(a.mean(dim=0).detach().cpu().numpy() + 1e-10), axis=-1)
-        ))(attentions[l_idx])
+        avg_attn, entropy = calculate_layer_stats(attentions[l_idx])
         
-        # 1. Graf
-        net = create_styled_graph(tokens, avg_attn, entropy, hide_sys)
+        net = create_styled_graph(tokens, labels, avg_attn, entropy, hide_sys)
         path = f"graph_v{l_idx}.html"
         net.save_graph(path)
         with open(path, 'r', encoding='utf-8') as f:
-            components.html(f.read(), height=620)
+            components.html(f.read(), height=670)
         
-        # 2. Fraser
-        phrases = get_phrases(tokens, avg_attn)
-        if phrases:
-            st.write("**Identifiserte frase-klynger:**")
-            for p in phrases: st.info(p)
-        else:
-            st.write("*Ingen sterke fraser funnet i dette laget.*")
         st.write("---")
 
-    # --- 5. DIN SISTE DATARAMME ---
-    st.write("### 📊 Komplett Rådata (Siste Lag)")
-    
-    last_attn, last_entropy = (lambda a: (
-        a.mean(dim=0).detach().cpu().numpy(), 
-        -np.sum(a.mean(dim=0).detach().cpu().numpy() * np.log(a.mean(dim=0).detach().cpu().numpy() + 1e-10), axis=-1)
-    ))(attentions[layer_indices[-1]])
+    # --- 5. RÅDATA ---
+    st.write("### 📊 Rådata for Lag 12 (Siste Lag)")
+    last_attn, last_entropy = calculate_layer_stats(attentions[layer_indices[-1]])
 
     table_data = []
     for i in range(len(tokens)):
         for j in range(len(tokens)):
-            # Filtrer tabellen basert på samme checkbox som grafen
             if hide_sys and (is_special(tokens[i]) or is_special(tokens[j])):
                 continue
-            
             w = float(last_attn[i, j])
             if w > 0.001:
                 table_data.append({
-                    "Fra_Index": i, "Fra_Token": tokens[i],
-                    "Til_Index": j, "Til_Token": tokens[j],
+                    "Fra": labels[i], "Til": labels[j],
                     "Vekt": round(w, 5), "Entropi_Fra": round(float(last_entropy[i]), 3)
                 })
     
