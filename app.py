@@ -73,7 +73,7 @@ def create_styled_graph(tokens, labels, avg_attn, entropy, hide_sys=True):
             label=display_label, 
             color=node_color,
             shape="box", 
-            font={'size': 34, 'color': 'white', 'face': 'monospace'},
+            font={'size': 48, 'color': 'white', 'face': 'monospace'},
             margin=15,
             title=f"Original: {token}\nIndeks: {i}\nEntropi: {e_val:.3f}"
         )
