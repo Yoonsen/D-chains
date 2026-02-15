@@ -1,113 +1,157 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-from transformers import AutoTokenizer, AutoModel
 import torch
+from transformers import AutoTokenizer, AutoModel
 from pyvis.network import Network
 import streamlit.components.v1 as components
+import networkx as nx
 
-# --- 1. Funksjon for å hente data og beregne entropi ---
-def get_attention_data(text, model_name):
+# --- 1. Datatilkobling og Beregning ---
+
+def get_attention_and_entropy(text, model_name):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name, output_attentions=True)
     
     inputs = tokenizer(text, return_tensors="pt")
-    outputs = model(**inputs)
+    with torch.no_grad():
+        outputs = model(**inputs)
     
-    # attentions shape: (layers, batch, heads, seq_len, seq_len)
+    # Attentions: (layers, batch, heads, seq_len, seq_len)
     attentions = torch.stack(outputs.attentions).squeeze(1) 
     tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
     
     return attentions, tokens
 
-def calculate_entropy(attn_matrix):
-    # attn_matrix: (heads, seq_len, seq_len)
-    # Vi snitter over heads for å se lagets totale fokus
-    avg_attn = attn_matrix.mean(dim=0).detach().numpy()
+def calculate_layer_metrics(attn_tensor):
+    """Beregner gjennomsnittlig attention og entropi for et lag."""
+    # Snitt over alle attention-hoder
+    avg_attn = attn_tensor.mean(dim=0).detach().cpu().numpy()
+    
+    # Entropi per token: H = -sum(p * log(p))
     epsilon = 1e-10
     entropy = -np.sum(avg_attn * np.log(avg_attn + epsilon), axis=-1)
-    return entropy, avg_attn
+    
+    return avg_attn, entropy
 
-# --- 2. Pyvis Visualisering ---
-def create_pyvis_graph(tokens, avg_attn, entropy, layer_idx, hide_system_nodes=True):
-    net = Network(height="400px", width="100%", notebook=False, directed=True)
+# --- 2. Graf-visualisering (Pyvis) ---
+
+def create_pyvis_graph(tokens, avg_attn, entropy, hide_sys=True):
+    net = Network(height="450px", width="100%", notebook=False, directed=True)
     
-    # Finn max/min entropi for fargeskalering
-    max_e = np.max(entropy)
-    min_e = np.min(entropy)
+    # Finn min/max for fargeskalering (JSON-safe)
+    e_min, e_max = float(np.min(entropy)), float(np.max(entropy))
     
+    # Legg til noder
     for i, token in enumerate(tokens):
-        if hide_system_nodes and token in ["[CLS]", "[SEP]", " ", " "]:
+        if hide_sys and token in ["[CLS]", "[SEP]", " ", " "]:
             continue
             
-        # Fargekoding basert på entropi (Lav = Rød/Fokusert, Høy = Grå/Diffus)
-        # Normaliserer til en verdi mellom 0 og 255
-        val = int(255 * (entropy[i] - min_e) / (max_e - min_e + 1e-6))
-        color = f"rgb({255-val}, {100}, {val})" # Går fra Rød mot Blå/Grå
+        # Beregn farge basert på entropi (Rød = Lav/Sikker, Blå = Høy/Usikker)
+        e_val = float(entropy[i])
+        norm_e = (e_val - e_min) / (e_max - e_min + 1e-6)
+        color = f"rgb({int(255*(1-norm_e))}, 100, {int(255*norm_e)})"
         
-        net.add_node(i, label=token, title=f"Entropy: {entropy[i]:.2f}", color=color)
+        net.add_node(
+            int(i), 
+            label=str(token), 
+            title=f"Entropy: {e_val:.3f}", 
+            color=color,
+            shape="dot",
+            size=20
+        )
 
+    # Legg til kanter (kun de sterkeste for å unngå JSON-støy)
     for i in range(len(tokens)):
         for j in range(len(tokens)):
-            weight = avg_attn[i, j]
-            if weight > 0.1: # Terskel for å unngå visuelt kaos
-                if hide_system_nodes and (tokens[i] in ["[CLS]", "[SEP]"] or tokens[j] in ["[CLS]", "[SEP]"]):
+            weight = float(avg_attn[i, j])
+            if weight > 0.08:  # Terskel for synlighet
+                if hide_sys and (tokens[i] in ["[CLS]", "[SEP]"] or tokens[j] in ["[CLS]", "[SEP]"]):
                     continue
-                net.add_edge(i, j, value=weight, title=f"Weight: {weight:.3f}")
+                if i == j: continue # Hopp over self-attention for renere graf
+                
+                net.add_edge(
+                    int(j), int(i), # Retning: kilde -> mål
+                    value=weight, 
+                    title=f"Weight: {weight:.3f}",
+                    color="rgba(200, 200, 200, 0.5)"
+                )
     
     net.set_options("""
-    var options = { "physics": { "barnesHut": { "gravitationalConstant": -2000, "centralGravity": 0.3, "springLength": 95 } } }
+    var options = {
+      "physics": { "barnesHut": { "gravitationalConstant": -1500, "centralGravity": 0.3, "springLength": 120 } },
+      "edges": { "smooth": { "type": "continuous" } }
+    }
     """)
     return net
 
-# --- 3. Streamlit App ---
-st.set_page_config(layout="wide")
-st.title("🧠 LLM Coreference & Entropy Visualizer")
+# --- 3. Klynge-analyse (D-chains) ---
 
-col1, col2, col3 = st.columns([4, 3, 2])
-with col1:
-    text = st.text_input("Input sentence", "Ola sov. Han var trøtt.")
-with col2:
-    model_name = st.selectbox("Model", ["bert-base-multilingual-cased", "NbAiLab/nb-bert-base"])
-with col3:
-    hide_sys = st.checkbox("Skjul [CLS]/[SEP]", value=True)
+def find_cliques_with_confidence(tokens, avg_attn, entropy):
+    G = nx.Graph()
+    # Bygg en midlertidig NetworkX-graf for klynge-deteksjon
+    for i in range(len(tokens)):
+        for j in range(len(tokens)):
+            if avg_attn[i,j] > 0.15: # Sterkere terskel for klikker
+                G.add_edge(i, j, weight=float(avg_attn[i,j]))
+    
+    cliques = list(nx.find_cliques(G))
+    results = []
+    
+    for c in cliques:
+        if len(c) >= 3: # Vi ser etter 3-cliques eller større
+            words = [tokens[idx] for idx in sorted(c) if tokens[idx] not in ["[CLS]", "[SEP]"]]
+            if len(words) < 3: continue
+            
+            # Beregn selvtillit (lav entropi = høy selvtillit)
+            avg_e = np.mean([entropy[idx] for idx in c])
+            conf = 1.0 / (1.0 + avg_e)
+            results.append({"Klynge": " + ".join(words), "Confidence": round(float(conf), 3)})
+            
+    return pd.DataFrame(results).sort_values(by="Confidence", ascending=False)
 
-if st.button("Analyser Lag for Lag"):
-    attentions, tokens = get_attention_data(text, model_name)
-    
-    # Vi viser Lag 1 (Syntaks) og Lag 5 (Semantikk/Koreferanse)
-    layers_to_show = [0, 2, 4] # Lag 1, 3 og 5
-    
-    cols = st.columns(len(layers_to_show))
-    
-    for idx, layer_num in enumerate(layers_to_show):
-        with cols[idx]:
-            st.subheader(f"Lag {layer_num + 1}")
-            entropy, avg_attn = calculate_entropy(attentions[layer_num])
-            
-            # Lag graf
-            net = create_pyvis_graph(tokens, avg_attn, entropy, layer_num, hide_sys)
-            path = f"graph_l{layer_num}.html"
-            net.save_graph(path)
-            
-            with open(path, 'r', encoding='utf-8') as f:
-                components.html(f.read(), height=450)
-            
-            st.caption("🔴 Mørkerød = Fokusert | 🔵 Blå/Grå = Diffus")
+# --- 4. Streamlit UI ---
 
-    # Tabell for dypdykk i Lag 5
-    st.write("### Nærbilde: Lag 5 Attention-vekter")
-    final_entropy, final_attn = calculate_entropy(attentions[4])
+st.set_page_config(page_title="D-chains Visualizer", layout="wide")
+st.title("🔗 D-chains: Attention Hierarkier")
+st.markdown("Visualiser hvordan modellen knytter ord sammen fra Lag 1 (syntaks) til Lag 12 (semantikk).")
+
+with st.sidebar:
+    st.header("Innstillinger")
+    model_name = st.selectbox("Velg modell", ["bert-base-multilingual-cased", "NbAiLab/nb-bert-base"])
+    hide_sys = st.checkbox("Skjul system-tokens ([CLS], [SEP])", value=True)
+    st.info("Rød node = Fokusert/Sikker\nBlå node = Diffus/Usikker (f.eks. 'båthus')")
+
+text = st.text_input("Input setning:", "Ola sov. Han var trøtt.")
+
+if text:
+    attentions, tokens = get_attention_and_entropy(text, model_name)
     
-    edges = []
-    for i, t1 in enumerate(tokens):
-        for j, t2 in enumerate(tokens):
-            if t1 in ["[CLS]", "[SEP]"] or t2 in ["[CLS]", "[SEP]"]: continue
-            if final_attn[i,j] > 0.05:
-                edges.append({"Fra": t1, "Til": t2, "Vekt": final_attn[i,j], "Avstand": abs(i-j)})
+    # Velg ut tre representative lag
+    layers_idx = [0, 5, 11] # Første, midtre, siste
+    cols = st.columns(len(layers_idx))
     
-    df = pd.DataFrame(edges).sort_values(by="Vekt", ascending=False)
-    st.dataframe(df)
+    for i, l_idx in enumerate(layers_idx):
+        with cols[i]:
+            st.subheader(f"Lag {l_idx + 1}")
+            avg_attn, entropy = calculate_layer_metrics(attentions[l_idx])
+            
+            # Lag og lagre Pyvis-graf
+            net = create_pyvis_graph(tokens, avg_attn, entropy, hide_sys)
+            html_path = f"layer_{l_idx}.html"
+            net.save_graph(html_path)
+            
+            with open(html_path, 'r', encoding='utf-8') as f:
+                components.html(f.read(), height=470)
+            
+            # Vis klynger for dette laget
+            st.write("**Identifiserte klynger:**")
+            df_cliques = find_cliques_with_confidence(tokens, avg_attn, entropy)
+            if not df_cliques.empty:
+                st.dataframe(df_cliques, hide_index=True)
+            else:
+                st.write("*Ingen sterke klynger funnet.*")
 
 st.markdown("---")
-st.markdown("**Test-case for koreferanse:** Prøv setningen `Ola slo Per fordi han var sint.` Se om `han` peker mest på `Ola` eller `Per` i lag 5!")
+st.write("### Hvorfor 'all-over-the-place'?")
+st.write("Hvis et ord har høy entropi (blå farge) og mange tynne kanter, betyr det at modellen er usikker. Dette skjer ofte med sjeldne ord eller ord som mangler kontekst.")
